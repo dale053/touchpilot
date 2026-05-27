@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -13,6 +14,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
 import android.text.InputType
 import android.view.inputmethod.EditorInfo
@@ -42,6 +44,7 @@ import dev.touchpilot.app.security.ToolApprovalProvider
 import dev.touchpilot.app.security.ToolSource
 import dev.touchpilot.app.tools.AndroidToolExecutor
 import dev.touchpilot.app.tools.ToolExecutionLog
+import dev.touchpilot.app.tools.ToolResult
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -63,6 +66,7 @@ class MainActivity : Activity() {
     private lateinit var chatTaskInput: EditText
     private lateinit var statusView: TextView
     private lateinit var executionLogView: TextView
+    private lateinit var latestResultView: TextView
     private var bottomNav: TabLayout? = null
 
     private var activeSection = Section.CHAT
@@ -70,6 +74,8 @@ class MainActivity : Activity() {
     private var pendingSettingsAnimationDirection = 0
     private var selectedSkillId: String? = null
     private var expandedSkillReferenceId: String? = null
+    private var lastFocusInputArgs: Map<String, String>? = null
+    private var focusSelectorIndex: Int = 0
     private val conversation = mutableListOf<ChatEvent>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -634,6 +640,13 @@ class MainActivity : Activity() {
             }.apply { id = R.id.observe_screen_button }
         )
 
+        contentRoot.addView(
+            secondaryButton("Get Foreground App") {
+                executeAndRender("get_foreground_app", emptyMap())
+                showSection(Section.TOOLS)
+            }.apply { id = R.id.get_foreground_app_button }
+        )
+
         val appInput = editText("App package or launcher label").apply { id = R.id.open_app_input }
         contentRoot.addView(appInput)
         contentRoot.addView(
@@ -660,10 +673,96 @@ class MainActivity : Activity() {
             secondaryButton("Type Into Focused Field") {
                 val value = typeInput.text.toString()
                 hideKeyboard(typeInput)
-                typeInput.requestFocus()
-                executeAndRender("type_text", mapOf("text" to value))
-                showSection(Section.TOOLS)
+                val focusResult = lastFocusInputArgs?.let { focusArgs ->
+                    executeAndRender("focus_input", focusArgs)
+                }
+                if (focusResult == null || focusResult.ok) {
+                    executeAndRender("type_text", mapOf("text" to value))
+                }
             }.apply { id = R.id.type_text_button }
+        )
+
+        contentRoot.addView(formLabel("Focus selector"))
+
+        val focusInputField = editText(FocusInputSelectorHints[focusSelectorIndex]).apply {
+            id = R.id.focus_input_input
+        }
+        val segmentButtons = mutableListOf<MaterialButton>()
+
+        fun refreshSegments() {
+            segmentButtons.forEachIndexed { i, btn ->
+                val active = i == focusSelectorIndex
+                btn.backgroundTintList = ColorStateList.valueOf(
+                    if (active) Theme.Accent else Theme.SurfaceRaised
+                )
+                btn.setTextColor(if (active) Theme.OnAccent else Theme.MutedText)
+                btn.strokeWidth = if (active) 0 else 1
+            }
+            focusInputField.hint = FocusInputSelectorHints[focusSelectorIndex]
+        }
+
+        val selectorRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 8, 0, 4) }
+        }
+        FocusInputSelectorLabels.forEachIndexed { i, label ->
+            val btn = MaterialButton(this).apply {
+                text = label
+                textSize = 11f
+                isAllCaps = false
+                cornerRadius = 16
+                minHeight = 44
+                insetTop = 0
+                insetBottom = 0
+                strokeColor = ColorStateList.valueOf(Theme.StrokeDark)
+                setOnClickListener {
+                    focusSelectorIndex = i
+                    refreshSegments()
+                }
+            }
+            segmentButtons.add(btn)
+            selectorRow.addView(
+                btn,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(3, 0, 3, 0)
+                }
+            )
+        }
+        refreshSegments()
+
+        contentRoot.addView(selectorRow)
+        contentRoot.addView(focusInputField)
+
+        val focusDismissRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        focusDismissRow.addView(
+            secondaryButton("Focus Input Field") {
+                hideKeyboard(focusInputField)
+                val args = mapOf(focusInputSelectorKey(focusSelectorIndex) to focusInputField.text.toString())
+                val result = executeAndRender("focus_input", args)
+                if (result.ok) {
+                    lastFocusInputArgs = args
+                } else {
+                    lastFocusInputArgs = null
+                }
+            }.apply { id = R.id.focus_input_button },
+            rowButtonParams()
+        )
+        focusDismissRow.addView(
+            secondaryButton("Dismiss Keyboard") {
+                executeAndRender("dismiss_keyboard", emptyMap())
+                showSection(Section.TOOLS)
+            }.apply { id = R.id.dismiss_keyboard_button },
+            rowButtonParams()
+        )
+        contentRoot.addView(focusDismissRow)
+
+        contentRoot.addView(
+            secondaryButton("Clear Focused Field") {
+                executeAndRender("clear_text", emptyMap())
+            }.apply { id = R.id.clear_text_button }
         )
 
         val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -752,7 +851,49 @@ class MainActivity : Activity() {
             }.apply { id = R.id.wait_for_text_button }
         )
 
-        contentRoot.addView(timelineCard("Latest result", outputText))
+        contentRoot.addView(latestResultCard())
+
+        // Tail spacer so the Focus / Dismiss row can scroll above the soft
+        // keyboard when an input is focused (adjustResize alone leaves them
+        // flush against the IME). The spacer is 0 dp tall when the keyboard
+        // is hidden and grows only while the IME is visible, so it does not
+        // add visible whitespace in the resting layout.
+        val keyboardScrollSpacer = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0
+            )
+        }
+        contentRoot.addView(keyboardScrollSpacer)
+        bindKeyboardScrollSpacer(keyboardScrollSpacer)
+    }
+
+    private fun bindKeyboardScrollSpacer(spacer: View) {
+        val rootView = window.decorView
+        val expandedHeight = (320 * resources.displayMetrics.density).toInt()
+        val visibleRect = Rect()
+        val listener = ViewTreeObserver.OnGlobalLayoutListener {
+            rootView.getWindowVisibleDisplayFrame(visibleRect)
+            val screenHeight = rootView.height
+            if (screenHeight <= 0) return@OnGlobalLayoutListener
+            val occluded = screenHeight - visibleRect.bottom
+            // Anything above ~15% of screen height is conservatively treated
+            // as the soft keyboard rather than a tall status/nav bar.
+            val keyboardVisible = occluded > screenHeight * 0.15
+            val target = if (keyboardVisible) expandedHeight else 0
+            val params = spacer.layoutParams as? LinearLayout.LayoutParams ?: return@OnGlobalLayoutListener
+            if (params.height != target) {
+                params.height = target
+                spacer.layoutParams = params
+            }
+        }
+        rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
+        spacer.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) = Unit
+            override fun onViewDetachedFromWindow(v: View) {
+                rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+            }
+        })
     }
 
     private fun renderMcpPanel() {
@@ -974,10 +1115,18 @@ class MainActivity : Activity() {
 
     private var outputText: String = "No result yet."
 
-    private fun executeAndRender(name: String, args: Map<String, String>) {
+    private fun executeAndRender(name: String, args: Map<String, String>): ToolResult {
         val result = toolExecutor.execute(name, args, ToolSource.DIRECT_DEBUG)
         outputText = SensitiveTextRedactor.redact("$name($args) -> ${result.ok}: ${result.message}")
+        refreshLatestResult()
         refreshExecutionLog()
+        return result
+    }
+
+    private fun refreshLatestResult() {
+        if (::latestResultView.isInitialized) {
+            latestResultView.text = outputText
+        }
     }
 
     private fun refreshExecutionLog() {
@@ -1006,6 +1155,14 @@ class MainActivity : Activity() {
 
     private fun selectedSkill(): Skill? {
         return skills.firstOrNull { it.id == selectedSkillId }
+    }
+
+    private fun focusInputSelectorKey(index: Int): String {
+        return when (index) {
+            1 -> "node_id"
+            2 -> "view_id"
+            else -> "text"
+        }
     }
 
     private fun rowButtonParams(): LinearLayout.LayoutParams {
@@ -1045,6 +1202,7 @@ class MainActivity : Activity() {
     private fun editText(hintText: String): EditText {
         return EditText(this).apply {
             hint = hintText
+            contentDescription = hintText
             setSingleLine(true)
             textSize = 14f
             setTextColor(Color.WHITE)
@@ -1347,6 +1505,38 @@ class MainActivity : Activity() {
         return card.withMargins(top = 8, bottom = 8)
     }
 
+    private fun latestResultCard(): View {
+        val card = MaterialCardView(this).apply {
+            setCardBackgroundColor(Theme.Card)
+            strokeColor = Theme.StrokeDark
+            strokeWidth = 1
+            radius = 18f
+            cardElevation = 0f
+            setPadding(18, 16, 18, 16)
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(18, 16, 18, 16)
+        }
+        content.addView(
+            TextView(this).apply {
+                text = "Latest result"
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+            }
+        )
+        latestResultView = TextView(this).apply {
+            text = outputText
+            textSize = 12.5f
+            setTextColor(Theme.BodyText)
+            setPadding(0, 8, 0, 0)
+        }
+        content.addView(latestResultView)
+        card.addView(content)
+        return card.withMargins(top = 10, right = 42, bottom = 10)
+    }
+
     private fun View.withMargins(
         left: Int = 0,
         top: Int = 0,
@@ -1508,6 +1698,13 @@ class MainActivity : Activity() {
     private companion object {
         const val ApprovalTimeoutMs = 5 * 60 * 1000L
         const val MaxApprovalArgLength = 500
+        val ProviderModeLabels = listOf("Local router", "Local model")
+        val FocusInputSelectorLabels = listOf("Text", "Node ID", "View ID")
+        val FocusInputSelectorHints = listOf(
+            "Text or content description",
+            "Node path  ·  e.g. 0.1.2",
+            "Resource ID  ·  e.g. com.app:id/field"
+        )
     }
 
     private object Theme {
